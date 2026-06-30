@@ -1,7 +1,24 @@
-"""
-Universal Power-MOSFET Datasheet Parameter Extractor  v1
-========================================================
+﻿"""
+Universal Power-MOSFET Datasheet Parameter Extractor  v19
+==========================================================
 SINGLE FILE — no helper scripts needed.
+
+Changes vs v18:
+  • R_DS(on) unit fix: Infineon Symbol-font encodes Ω as 'W'. The extractor
+    now recognises 'W' as Ω for that parameter, converts Ω → mΩ correctly,
+    and displays the unit as 'Ω' / 'mΩ' instead of 'W'.
+  • Improved log-scale capacitance-graph extraction (Ciss/Coss/Crss vs VDS):
+    — Wider X-axis label clip (22 px → 45 px below axis) catches labels
+      printed further from the axis line.
+    — Relaxed _try_log_fit decade-label tolerance (0.05 → 0.10) so labels
+      that are slightly off due to OCR noise still qualify.
+    — New _try_r2_log_fit: fits any set of positive values in log-space using
+      an R² ≥ 0.998 criterion; handles non-pure-decade scales (1 2 5 10…).
+    — Wider Y-axis clip ladder adds 240 px tier for wide two-up layouts.
+  • Graph-to-table back-fill: when Ciss / Coss / Crss are missing from the
+    tabular section but were successfully extracted from the capacitance graph,
+    the parameter table is auto-populated with the interpolated value at the
+    nearest available VDS and at 400 V.
 
 Built on the same engine as the SiC/Si Schottky diode extractor, retargeted
 to power MOSFETs (Infineon CoolMOS/CoolSiC, ST, ON Semi, Toshiba, Nexperia,
@@ -595,14 +612,72 @@ def _find_plot_boxes(page):
         return [(xs[k], xs[k + 1], y0, y1) for k in range(len(xs) - 1)
                 if xs[k + 1] - xs[k] > 60]
 
+    # ── split vertically stacked (2-row / n-row) layouts ────────────────
+    # Nexperia prints 2×2 grids where pairs of graphs share the same X
+    # coordinates (one on top of the other).  After the COLUMN split above
+    # each column still covers both rows.  A full-width internal horizontal
+    # at which the vertical gridlines TERMINATE (endpoints, not crossings)
+    # is a ROW divider — exactly the transposed column-divider logic.
+    def _split_rows(box):
+        x0, x1, y0, y1 = box
+        bw = x1 - x0
+        if bw <= 0 or (y1 - y0) <= 120:
+            return [box]
+        divs = sorted(hy for (hx0, hx1, hy) in Hp
+                      if y0 + 12 < hy < y1 - 12
+                      and hx0 <= x0 + 0.12 * bw and hx1 >= x1 - 0.12 * bw)
+        clustered = []
+        for hy in divs:
+            if not clustered or hy - clustered[-1] > 12:
+                clustered.append(hy)
+        real = []
+        for hy in clustered:
+            endpoint = sum(1 for (vy0, vy1, vx) in V
+                          if x0 - 3 <= vx <= x1 + 3 and (vy1 - vy0) > 40
+                          and (abs(vy0 - hy) < 4 or abs(vy1 - hy) < 4))
+            crossing = sum(1 for (vy0, vy1, vx) in V
+                          if x0 - 3 <= vx <= x1 + 3 and (vy1 - vy0) > 40
+                          and vy0 < hy - 4 and vy1 > hy + 4)
+            if endpoint >= 2 and endpoint >= crossing:
+                real.append(hy)
+        if not real:
+            return [box]
+        ys = [y0] + real + [y1]
+        return [(x0, x1, ys[k], ys[k + 1]) for k in range(len(ys) - 1)
+                if ys[k + 1] - ys[k] > 60]
+
     split = []
     for b in uniq:
-        split.extend(_split_columns(b))
+        for cb in _split_columns(b):
+            split.extend(_split_rows(cb))
     out = []
     for b in split:
         if not any(all(abs(b[i] - u[i]) < 5 for i in range(4)) for u in out):
             out.append(b)
-    return out
+
+    # Remove boxes that are strict supersets of smaller boxes.
+    # When a 2×2 grid (e.g. Nexperia) is split into inner sub-boxes, the
+    # pre-split outer column/row boxes still survive de-duplication above.
+    # Keeping them misleads Y-axis clip positioning: the outer box x0 lands
+    # on the column divider, so the Y clip searches in the wrong column and
+    # misses the actual tick labels, producing garbage calibration.
+    filtered = []
+    for a in out:
+        ax0, ax1, ay0, ay1 = a
+        aw, ah = ax1 - ax0, ay1 - ay0
+        has_inner = False
+        for b in out:
+            if b == a:
+                continue
+            bx0, bx1, by0, by1 = b
+            if (bx0 >= ax0 - 5 and bx1 <= ax1 + 5 and
+                    by0 >= ay0 - 5 and by1 <= ay1 + 5 and
+                    (bx1 - bx0) < aw - 10 and (by1 - by0) < ah - 10):
+                has_inner = True
+                break
+        if not has_inner:
+            filtered.append(a)
+    return filtered
 
 def _collect_curve_segments(page, box, margin=2.0):
     """Vector segments of the data curves inside the plot box.
@@ -649,7 +724,7 @@ def _collect_curve_segments(page, box, margin=2.0):
                 on_border = min(abs(ay - y0), abs(ay - y1)) < 1.2
             else:
                 on_border = min(abs(ax - x0), abs(ax - x1)) < 1.2
-            if not (kind == "l" and grid_w > 0 and wd >= 1.5 * grid_w
+            if not (kind in ("l", "c") and grid_w > 0 and wd >= 1.5 * grid_w
                     and not on_border):
                 continue
         segs.append((ax, ay, bx, by))
@@ -1262,6 +1337,12 @@ def _figure_captions(page):
             # and mis-classifying the whole figure.  -6 keeps true wrapped
             # lines while the same-column (xov) + line-pitch guards prevent
             # grabbing unrelated text.
+            # Skip internal image-reference codes (e.g. Nexperia "aaa-038915").
+            # These appear at the TOP of the adjacent figure's plot area (just
+            # inside the inter-row gap) and their 5 px vgap falls below the
+            # break threshold, but they are never part of any figure caption.
+            if re.match(r'^aaa[-_\s]?\d{4,}', t2, re.I):
+                continue
             if vgap >= -6 and len(cap) < 240:
                 cap += " " + t2
                 cbb = [min(cbb[0], b2[0]), cbb[1], max(cbb[2], b2[2]), b2[3]]
@@ -1380,7 +1461,11 @@ def _text_axis_labels(page, clip, axis="x"):
     out = []
     for x0, y0, x1, y1, t in _merge_number_words(ws):
         t = t.replace(",", ".").strip()
-        if not re.fullmatch(r"-?\d+(\.\d+)?", t): continue
+        if not re.fullmatch(r"-?\d+(\.\d+)?", t):
+            # Strip trailing temperature unit (e.g. "25°C" → "25", "150 °C" → "150")
+            t = re.sub(r'\s*°\s*[CcFfKk]?\s*$', '', t)
+            if not re.fullmatch(r"-?\d+(\.\d+)?", t):
+                continue
         out.append((float(t), (x0 + x1) / 2 if axis == "x" else (y0 + y1) / 2))
     return out
 
@@ -1428,15 +1513,46 @@ def _calibrate_axis(page, box, axis, interactive, caption):
     """One axis: text → OCR → LOG decade labels → log fallback → user prompt → normalised.
     Returns ((m, c), method, is_log); value = m*px+c, or 10**(m*px+c) if log."""
     x0, x1, y0, y1 = box
+    _is_log_cap_pre = (_ZTH_PAT.search(caption or "")
+                       or _CAP_PAT.search(caption or "")
+                       or re.search(r"\bE\s*[_(]?\s*oss\b|stored\s+energy",
+                                    caption or "", re.I))
     if axis == "x":
-        clip = fitz.Rect(x0 - 22, y1 + 1, x1 + 26, y1 + 22); lo, hi = x0, x1
+        # Capacitance/Zth plots use a log VDS or tp X axis; their tick labels
+        # are often printed 30-45 px below the axis line.  Use a deeper clip
+        # (45 px instead of 22 px) for those figure types so the labels land
+        # inside the clip region even on two-up or unusually spaced layouts.
+        _x_depth = 45 if _is_log_cap_pre else 22
+        clip = fitz.Rect(x0 - 22, y1 + 1, x1 + 26, y1 + _x_depth); lo, hi = x0, x1
     else:
         clip = fitz.Rect(x0 - 42, y0 - 8, x0 - 1, y1 + 8);   lo, hi = y1, y0
+
+    # Normalised-resistance Y-axis guard.
+    # Infineon two-up layouts place VGS curve labels (6.5V, 7V, 10V, 20V) from
+    # the left diagram inside the Y-axis clip of the right (normalised-Rds) diagram.
+    # A good calibration requires ≥3 OCR labels in the physical ratio band [0, 5.5]
+    # AND those in-band labels must be a majority (≥50 %) of all OCR reads.
+    # Without this, OCR picks up VGS values and maps the axis to ~−6 … 26.
+    _is_norm_resist = (axis == "y" and re.search(
+        r"on.?state\s+resist|rds\s*[\(\[]?\s*on|drain.source.*resist",
+        caption or "", re.I))
+
+    def _ocr_ok(lbl_set):
+        """True when lbl_set is a plausible normalised-resistance Y-axis label set."""
+        if not _is_norm_resist:
+            return True          # no restriction for non-resistance figures
+        if not lbl_set:
+            return False
+        in_band = [v for v, _ in lbl_set if 0.0 <= v <= 5.5]
+        return len(in_band) >= 3 and len(in_band) >= 0.5 * len(lbl_set)
+
     text_lbl = _text_axis_labels(page, clip, axis)
     fit = _robust_axis_fit(text_lbl, lo, hi)
     if fit: return (fit[0], fit[1]), "text labels", False
     ocr_lbl = _ocr_axis_labels(page, clip, axis=axis)
     fit = _robust_axis_fit(ocr_lbl, lo, hi)
+    if fit and not _ocr_ok(ocr_lbl):
+        fit = None    # contaminated by neighbouring-diagram labels → skip
     if fit: return (fit[0], fit[1]), "OCR", False
     # logarithmic axis: decade labels 10^k (text layer, exponent superscripts).
     # X-log is normally off (most X axes are linear and text/OCR labels above
@@ -1458,6 +1574,15 @@ def _calibrate_axis(page, box, axis, interactive, caption):
         ocr_dec = _ocr_decade_axis_labels(page, clip, axis=axis)
         fit = _robust_axis_fit(ocr_dec, lo, hi) if len(ocr_dec) >= 3 else None
         if fit: return (fit[0], fit[1]), "OCR decade labels", True
+    # SI prefix time labels: Zth X-axis uses "1µ", "10µs", "1m", "100ms" etc.
+    # These are invisible to all numeric-only parsers above.
+    if _is_log_cap and axis == 'x':
+        si_lbl = _si_time_axis_labels(page, clip, axis=axis)
+        fit = _robust_axis_fit(si_lbl, lo, hi) if len(si_lbl) >= 3 else None
+        if fit: return (fit[0], fit[1]), "SI prefix labels (log)", True
+        ocr_si_lbl = _ocr_si_time_axis_labels(page, clip, axis=axis)
+        fit = _robust_axis_fit(ocr_si_lbl, lo, hi) if len(ocr_si_lbl) >= 3 else None
+        if fit: return (fit[0], fit[1]), "OCR SI prefix labels (log)", True
     # Log-fit fallback: when axis labels are plain numbers (1, 10, 100, 1000)
     # without "10^k" notation, the linear fits above fail but a fit in log10
     # space succeeds.  STRICT filter: only keep values that are exact powers of
@@ -1465,6 +1590,7 @@ def _calibrate_axis(page, box, axis, interactive, caption):
     # 4, 5 from exponent digits, or random page numbers) cannot trigger a false
     # log calibration.  Also require ≥1 decade span and ≥3 qualifying points.
     def _try_log_fit(labels, method_name):
+        """Strict log fit: only accept near-exact powers of 10."""
         if not labels:
             return None, None
         log_pts = []
@@ -1472,7 +1598,7 @@ def _calibrate_axis(page, box, axis, interactive, caption):
             if v <= 0:
                 continue
             lv = math.log10(v)
-            if abs(lv - round(lv)) < 0.05:      # must be a near-exact decade
+            if abs(lv - round(lv)) < 0.10:      # relaxed: ±0.10 for OCR noise
                 log_pts.append((round(lv), p))
         if len(log_pts) < 3:
             return None, None
@@ -1481,22 +1607,54 @@ def _calibrate_axis(page, box, axis, interactive, caption):
             return None, None
         f2 = _robust_axis_fit(log_pts, lo, hi)
         return (f2, method_name) if f2 else (None, None)
+
+    def _try_r2_log_fit(labels, method_name):
+        """General log fit using R²≥0.998 in log10 space.
+        Accepts any positive values (not limited to pure decades), so works for
+        axes labelled 1 2 5 10 20 50 100… common on capacitance plots."""
+        if not labels:
+            return None, None
+        pts = [(math.log10(v), px) for (v, px) in labels if v > 0]
+        if len(pts) < 3:
+            return None, None
+        log_span = max(p[0] for p in pts) - min(p[0] for p in pts)
+        if log_span < 1.0:
+            return None, None
+        # R² check: how well does log10(value) vary linearly with pixel?
+        xs = [p[1] for p in pts]; ys = [p[0] for p in pts]
+        n = len(xs)
+        xm = sum(xs) / n; ym = sum(ys) / n
+        ssxx = sum((x - xm) ** 2 for x in xs)
+        ssyy = sum((y - ym) ** 2 for y in ys)
+        ssxy = sum((x - xm) * (y - ym) for x, y in zip(xs, ys))
+        if ssxx < 1e-12 or ssyy < 1e-12:
+            return None, None
+        r2 = (ssxy ** 2) / (ssxx * ssyy)
+        if r2 < 0.998:
+            return None, None
+        f2 = _robust_axis_fit(pts, lo, hi)
+        return (f2, method_name) if f2 else (None, None)
+
     # Only apply log fallback for known log-scale graph types (capacitance, Zth)
     if _is_log_cap:
         for lbl_set, meth in ((text_lbl, "text labels (log)"), (ocr_lbl, "OCR (log)")):
             f2, mn = _try_log_fit(lbl_set, meth)
             if f2: return (f2[0], f2[1]), mn, True
+            f2, mn = _try_r2_log_fit(lbl_set, meth + " (R²)")
+            if f2: return (f2[0], f2[1]), mn, True
     # Wider Y-axis clip fallback: Infineon two-up layouts place the shared Y
     # axis labels far to the left of the right-subbox edge; the standard 42px
-    # clip misses them.  Try 100px and 160px widths before giving up.
+    # clip misses them.  Try 100 px, 160 px and 240 px widths before giving up.
     if axis == "y":
-        for extra in (58, 118):   # adds 58 or 118 px → total 100 or 160 px
+        for extra in (58, 118, 198):   # adds 58/118/198 px → 100/160/240 px total
             wide_clip = fitz.Rect(x0 - 42 - extra, y0 - 8, x0 - 1, y1 + 8)
             t2 = _text_axis_labels(page, wide_clip, axis)
             fit = _robust_axis_fit(t2, lo, hi)
             if fit: return (fit[0], fit[1]), "text labels (Y wide)", False
             o2 = _ocr_axis_labels(page, wide_clip, axis=axis)
             fit = _robust_axis_fit(o2, lo, hi)
+            if fit and not _ocr_ok(o2):
+                fit = None    # wide-clip contaminated by neighbouring labels → skip
             if fit: return (fit[0], fit[1]), "OCR (Y wide)", False
             if _is_log_cap:
                 d2 = _decade_axis_labels(page, wide_clip, axis=axis)
@@ -1509,6 +1667,33 @@ def _calibrate_axis(page, box, axis, interactive, caption):
                                       (o2, "OCR (log, Y wide)")):
                     f2, mn = _try_log_fit(lbl_set, meth)
                     if f2: return (f2[0], f2[1]), mn, True
+                    f2, mn = _try_r2_log_fit(lbl_set, meth + " (R²)")
+                    if f2: return (f2[0], f2[1]), mn, True
+    # X-axis wide-clip fallback: some layouts print tick labels further below
+    # the axis line than the default 22/45 px clip captures.  Mirror the same
+    # progressive-widening strategy already used for the Y axis above.
+    if axis == "x":
+        for x_depth in (65, 90):
+            wide_xclip = fitz.Rect(x0 - 22, y1 + 1, x1 + 26, y1 + x_depth)
+            t2 = _text_axis_labels(page, wide_xclip, axis)
+            fit = _robust_axis_fit(t2, lo, hi)
+            if fit: return (fit[0], fit[1]), "text labels (X wide)", False
+            o2 = _ocr_axis_labels(page, wide_xclip, axis=axis)
+            fit = _robust_axis_fit(o2, lo, hi)
+            if fit: return (fit[0], fit[1]), "OCR (X wide)", False
+            if _is_log_cap:
+                d2 = _decade_axis_labels(page, wide_xclip, axis=axis)
+                fit = _robust_axis_fit(d2, lo, hi) if len(d2) >= 3 else None
+                if fit: return (fit[0], fit[1]), "log decade labels (X wide)", True
+                od2 = _ocr_decade_axis_labels(page, wide_xclip, axis=axis)
+                fit = _robust_axis_fit(od2, lo, hi) if len(od2) >= 3 else None
+                if fit: return (fit[0], fit[1]), "OCR decade labels (X wide)", True
+                si2 = _si_time_axis_labels(page, wide_xclip, axis=axis)
+                fit = _robust_axis_fit(si2, lo, hi) if len(si2) >= 3 else None
+                if fit: return (fit[0], fit[1]), "SI prefix labels (log, X wide)", True
+                ocr_si2 = _ocr_si_time_axis_labels(page, wide_xclip, axis=axis)
+                fit = _robust_axis_fit(ocr_si2, lo, hi) if len(ocr_si2) >= 3 else None
+                if fit: return (fit[0], fit[1]), "OCR SI prefix labels (log, X wide)", True
     if interactive and sys.stdin.isatty():
         try:
             ax_name = "X" if axis == "x" else "Y"
@@ -2231,9 +2416,18 @@ def extract_derating_curves(pdf_path, interactive=True):
                     thi = min(T1[-1], T2[-1])
                     if thi <= tlo:
                         return False
-                    tpts = np.linspace(tlo, thi, 20)
-                    v1s = np.interp(tpts, T1, V1)
-                    v2s = np.interp(tpts, T2, V2)
+                    tpts = (np.logspace(np.log10(tlo), np.log10(thi), 20)
+                            if xlog and tlo > 0 and thi > tlo
+                            else np.linspace(tlo, thi, 20))
+                    if xlog and tlo > 0:
+                        logT1 = np.log10(np.clip(T1, 1e-12, None))
+                        logT2 = np.log10(np.clip(T2, 1e-12, None))
+                        log_tpts = np.log10(np.clip(tpts, 1e-12, None))
+                        v1s = np.interp(log_tpts, logT1, V1)
+                        v2s = np.interp(log_tpts, logT2, V2)
+                    else:
+                        v1s = np.interp(tpts, T1, V1)
+                        v2s = np.interp(tpts, T2, V2)
                     if ylog:
                         v1s = np.log10(np.clip(v1s, 1e-12, None))
                         v2s = np.log10(np.clip(v2s, 1e-12, None))
@@ -2293,8 +2487,17 @@ def extract_derating_curves(pdf_path, interactive=True):
                     tlo, thi = max(T1[0], T2[0]), min(T1[-1], T2[-1])
                     if thi <= tlo:
                         return False
-                    tpts = np.linspace(tlo, thi, 15)
-                    v1s = np.interp(tpts, T1, V1); v2s = np.interp(tpts, T2, V2)
+                    tpts = (np.logspace(np.log10(tlo), np.log10(thi), 15)
+                            if xlog and tlo > 0 and thi > tlo
+                            else np.linspace(tlo, thi, 15))
+                    if xlog and tlo > 0:
+                        logT1 = np.log10(np.clip(T1, 1e-12, None))
+                        logT2 = np.log10(np.clip(T2, 1e-12, None))
+                        log_tpts = np.log10(np.clip(tpts, 1e-12, None))
+                        v1s = np.interp(log_tpts, logT1, V1)
+                        v2s = np.interp(log_tpts, logT2, V2)
+                    else:
+                        v1s = np.interp(tpts, T1, V1); v2s = np.interp(tpts, T2, V2)
                     if ylog:
                         v1s = np.log10(np.clip(v1s, 1e-12, None))
                         v2s = np.log10(np.clip(v2s, 1e-12, None))
@@ -2335,9 +2538,16 @@ def extract_derating_curves(pdf_path, interactive=True):
             curves_out = []
             for ci2, (T, V, coverage, lbl) in enumerate(conv, 1):
                 vals = []
+                _logT = np.log10(np.clip(T, 1e-12, None)) if xlog else None
+                _logV = np.log10(np.clip(V, 1e-12, None)) if ylog else None
                 for t in grid:
                     if T[0] - 1e-6 <= t <= T[-1] + 1e-6:
-                        v = float(np.interp(t, T, V))
+                        xi = np.log10(max(t, 1e-12)) if xlog else t
+                        src_x = _logT if xlog else T
+                        if ylog:
+                            v = 10 ** float(np.interp(xi, src_x, _logV))
+                        else:
+                            v = float(np.interp(xi, src_x, V))
                         vals.append(float(f"{v:.4g}") if ylog else round(v, 3))
                     else:
                         vals.append(None)
@@ -2390,6 +2600,87 @@ _FWD_CAP = re.compile(
     r"|forward\s+(voltage\s+drop|current).{0,45}(versus|vs\.?|as\s+a\s+function\s+of)"
     r".{0,45}(forward\s+)?(current|voltage)"
     r"|I\s*F?\s*=\s*f\s*\(\s*V", re.I)
+
+def _si_time_axis_labels(page, clip, axis='x'):
+    """Read Zth X-axis labels with SI prefix time notation.
+    Recognises '1µ', '10µs', '100µ', '1m', '10ms', '100m', '1', '10' etc.
+    Returns [(log10(seconds), center_coord)] for log-scale axis fitting."""
+    _SI = {'n': 1e-9, 'µ': 1e-6, 'u': 1e-6, 'm': 1e-3}
+    try:
+        ws = [(w[0], w[1], w[2], w[3], w[4]) for w in page.get_text("words")
+              if clip.x0 <= (w[0] + w[2]) / 2 <= clip.x1
+              and clip.y0 <= (w[1] + w[3]) / 2 <= clip.y1]
+    except Exception:
+        return []
+    out = []
+    for x0, y0, x1, y1, t in _merge_number_words(ws):
+        t = t.strip()
+        m = re.fullmatch(r'(\d+(?:\.\d+)?)\s*([nµum])\s*s?', t)
+        if m:
+            val = float(m.group(1)) * _SI.get(m.group(2), 1.0)
+        else:
+            m2 = re.fullmatch(r'(\d+(?:\.\d+)?)\s*s?', t)
+            if not m2:
+                continue
+            val = float(m2.group(1))
+        if val > 0:
+            pos = (x0 + x1) / 2 if axis == 'x' else (y0 + y1) / 2
+            out.append((math.log10(val), pos))
+    return out
+
+def _ocr_si_time_axis_labels(page, clip, axis='x', zoom=8):
+    """OCR version of _si_time_axis_labels for raster Zth images.
+    Uses a wider OCR character whitelist to capture µ, u, m, n prefix chars.
+    Returns [(log10(seconds), center_coord)] for log-scale axis fitting."""
+    if not (_HAS_OCR and _HAS_GRAPH):
+        return []
+    _SI = {'n': 1e-9, 'µ': 1e-6, 'u': 1e-6, 'm': 1e-3}
+    try:
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=clip)
+        img = Image.open(io.BytesIO(pix.tobytes("png")))
+        data = pytesseract.image_to_data(
+            img,
+            config="--psm 11 -c tessedit_char_whitelist=0123456789.nuµums",
+            output_type=pytesseract.Output.DICT)
+    except Exception:
+        return []
+    tokens = []
+    for i, txt in enumerate(data["text"]):
+        t = (txt or "").strip()
+        if not t:
+            continue
+        cx = clip.x0 + (data["left"][i] + data["width"][i] / 2) / zoom
+        cy = clip.y0 + (data["top"][i] + data["height"][i] / 2) / zoom
+        rx = data["left"][i] / zoom          # left edge in clip coords
+        tokens.append((t, cx if axis == 'x' else cy, rx))
+    out = []
+    i = 0
+    while i < len(tokens):
+        t, pos, lx = tokens[i]
+        # Combined token: "1µs", "10ms", "100ns" OCR'd as one string
+        cm = re.fullmatch(r'(\d+(?:\.\d+)?)\s*([nuµums])\s*s?', t, re.I)
+        if cm:
+            val = float(cm.group(1)) * _SI.get(cm.group(2).lower(), 1.0)
+            if val > 0:
+                out.append((math.log10(val), pos))
+            i += 1; continue
+        # Pure digit token — check if immediately followed by an SI prefix token
+        dm = re.fullmatch(r'\d+(?:\.\d+)?', t)
+        if dm:
+            num = float(t)
+            if i + 1 < len(tokens):
+                t2, pos2, lx2 = tokens[i + 1]
+                sm = re.fullmatch(r'([nuµums])\s*s?', t2, re.I)
+                if sm and (lx2 - lx) < 25 / zoom:
+                    val = num * _SI.get(sm.group(1).lower(), 1.0)
+                    if val > 0:
+                        out.append((math.log10(val), pos))
+                    i += 2; continue
+            # Plain number with no prefix → treat as seconds
+            if num > 0:
+                out.append((math.log10(num), pos))
+        i += 1
+    return out
 
 def _decade_axis_labels(page, clip, axis="y"):
     """Tick labels on a log axis: '10'+superscript exponent pairs, plain
@@ -3445,7 +3736,8 @@ _UNIT_FACTOR = {
     "pF":  {"pf":1.0,"nf":1e3,"µf":1e6,"uf":1e6},
     "µJ": {"µj":1.0,"uj":1.0,"mj":1e3,"nj":1e-3,"j":1e6},
     "K/W": {"k/w":1.0,"°c/w":1.0,"c/w":1.0},
-    "mΩ": {"mΩ":1.0,"mω":1.0,"mohm":1.0,"Ω":1e3,"ω":1e3,"ohm":1e3,"r":1e3,"kΩ":1e6,"kohm":1e6},
+    "mΩ": {"mΩ":1.0,"mω":1.0,"mohm":1.0,"Ω":1e3,"ω":1e3,"ohm":1e3,"r":1e3,"kΩ":1e6,"kohm":1e6,
+            "w":1e3},  # 'W' = Infineon Symbol-font mis-encoding of Ω (0x57)
 }
 
 def to_base(param, value, unit_text):
@@ -4544,6 +4836,11 @@ def extract(pdf_path, debug_png=None, interactive=True):
             # Unit priority: table unit column → catalogue default
             _eu = rec.get("extracted_unit")
             unit = _norm_unit(_eu) if _eu else _p["unit"]
+            # Infineon Symbol-font fix: Ω is mis-decoded as 'W' in PDF text.
+            # to_base() already converted the numeric value to mΩ (via the "w"
+            # key added to _UNIT_FACTOR["mΩ"]).  Correct the display unit here.
+            if _p["param"] == "R_DS(on)" and unit in ("W", "w"):
+                unit = "Ω"
             return dict(param=_p["param"],name=_p["full"],unit=unit,
                         section=_p["section"],note=_p["note"],
                         typ=rec["typ"],max=rec["max"],temp_c=rec["temp_c"],
@@ -4582,6 +4879,56 @@ def extract(pdf_path, debug_png=None, interactive=True):
         if not derating:
             print("      \u2013 no temperature-axis graphs found (or figures are raster images)")
 
+
+        # ── Graph-to-table back-fill for Ciss / Coss / Crss ─────────────────
+        # When a capacitance was not found in the tabular section but WAS
+        # extracted from the capacitance graph, inject the graph value into
+        # output_rows so the parameter table is not left as "Not Found".
+        cap_figs = [f for f in derating if f.get("kind") == "capacitance"]
+        _CLABEL_TO_PARAM = {"ciss": "C_iss", "coss": "C_oss", "crss": "C_rss"}
+        _GRAPH_VDS_DEFAULT = 400.0   # V — representative test point for 600 V devices
+
+        def _interp_cap_curve(fig, curve_label, vds_target):
+            """Interpolate a cap curve in log-log space at vds_target V.
+            Returns (c_pF, actual_vds) or (None, None) on failure."""
+            for cv in fig["curves"]:
+                if cv["label"].lower().strip() == curve_label.lower():
+                    vds_pts = fig["temps"]
+                    c_pts   = cv["vals"]
+                    pairs   = [(v, c) for v, c in zip(vds_pts, c_pts)
+                               if v is not None and c is not None and v > 0 and c > 0]
+                    if len(pairs) < 2:
+                        return None, None
+                    pairs.sort(key=lambda t: t[0])
+                    log_v   = [math.log10(p[0]) for p in pairs]
+                    log_c   = [math.log10(p[1]) for p in pairs]
+                    log_tgt = math.log10(max(vds_target, 1e-6))
+                    log_tgt = max(log_v[0], min(log_v[-1], log_tgt))
+                    log_c_out = float(np.interp(log_tgt, log_v, log_c))
+                    c_val = round(10 ** log_c_out, 2)
+                    nearest_vds = min(pairs, key=lambda p: abs(p[0] - vds_target))[0]
+                    return c_val, nearest_vds
+            return None, None
+
+        if cap_figs:
+            for row in output_rows:
+                pname = row.get("param", "")
+                if row.get("found") or pname not in _CLABEL_TO_PARAM.values():
+                    continue
+                clabel = next(k for k, v in _CLABEL_TO_PARAM.items() if v == pname)
+                for cfig in cap_figs:
+                    c_val, used_vds = _interp_cap_curve(cfig, clabel, _GRAPH_VDS_DEFAULT)
+                    if c_val is not None:
+                        row["typ"]     = fmt_val(c_val)
+                        row["max"]     = "—"
+                        row["temp_c"]  = 25
+                        row["cond"]    = f"VDS={fmt_val(used_vds)} V (from graph)"
+                        row["found"]   = True
+                        row["is_high"] = False
+                        print(f"      [graphs] Back-filled {pname} = {c_val} pF "
+                              f"@ VDS={used_vds} V from Figure "
+                              f"{cfig.get('fig_no', '?')} (graph extraction)")
+                        break
     return info,output_rows,derating
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -4606,7 +4953,7 @@ MC=("A","B","C","H","I")
 SC={"Required Parameters":"D6E4F0","Loss Analysis Parameters":"EAD8F7",
     "Thermal Parameters":"D5F0E4"}
 
-def _write_graph_sheet(wb, info, figs, sheet_title, intro):
+def _write_graph_sheet(wb, info, figs, sheet_title, intro, disclaimer=""):
     """Generic graph sheet: digitised curve data + embedded figure images.
     Used for both the Energy-graph and Temperature-graph sheets."""
     import tempfile
@@ -4635,8 +4982,16 @@ def _write_graph_sheet(wb, info, figs, sheet_title, intro):
     c.font = Font(name="Calibri", size=9, italic=True, color="555555")
     c.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
 
+    ws.merge_cells("A3:J3"); c = ws["A3"]
+    c.value = _xl_safe(disclaimer or
+                       "⚠  Note: The tabular data is approximated data, not the exact data.")
+    c.font = Font(name="Calibri", size=10, bold=True, color="7B2D00")
+    c.fill = PatternFill("solid", fgColor="FFF2CC")
+    c.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+    ws.row_dimensions[3].height = 20
+
     _tmpdir = tempfile.mkdtemp(prefix="mosfet_figs_")
-    cur = 4
+    cur = 5
     for fi, f in enumerate(figs):
         n_curves = len(f["curves"])
         img_col = n_curves + 3                       # leave one blank column
@@ -4823,14 +5178,16 @@ def write_excel(info,rows,out_path,derating=None):
                 "point-by-point. The X axis is whatever the datasheet plots against "
                 "(gate resistance RG, drain current ID, or junction temperature Tj) \u2014 "
                 "its printed unit is shown in the first column header. The original "
-                "figure is embedded next to each table for checking.")
+                "figure is embedded next to each table for checking.",
+                disclaimer="\u26a0  Note: The tabular data is approximated data, not the exact data.")
         if temp_figs:
             _write_graph_sheet(
                 wb, info, temp_figs, "Temperature Graphs",
                 "Every figure whose variable is a temperature (Tj / Tc / Ta / Th): "
                 "RDS(on) vs Tj, ID/Ptot derating vs Tc, SOA, etc. Values are read "
                 "point-by-point (accuracy ~1-2% of full scale). The original figure is "
-                "embedded next to each table for checking.")
+                "embedded next to each table for checking.",
+                disclaimer="\u26a0  Note: The tabular data is approximated data, not the exact data.")
         if thermal_figs:
             _write_graph_sheet(
                 wb, info, thermal_figs, "Thermal Impedance Graphs",
@@ -4838,14 +5195,20 @@ def write_excel(info,rows,out_path,derating=None):
                 "(D = tp/T) curve family. Both axes are logarithmic (tp in seconds, "
                 "ZthJC in K/W), so digitised values are approximate \u2014 treat the "
                 "embedded figure as the authoritative source and use the table for "
-                "quick interpolation of the single-pulse / duty-cycle envelope.")
+                "quick interpolation of the single-pulse / duty-cycle envelope.",
+                disclaimer="\u26a0  Note: Tried our best, but not able to extract correctly "
+                           "\u2014 both axes are logarithmic and the digitised values are approximate. "
+                           "Use the embedded figure as the authoritative source.")
         if cap_figs:
             _write_graph_sheet(
                 wb, info, cap_figs, "Capacitance Graphs",
                 "Junction capacitances C = f(VDS): Ciss, Coss and Crss versus "
                 "drain-source voltage (VGS = 0 V). The Y axis is logarithmic (pF); "
                 "values are read point-by-point and the original figure is embedded "
-                "next to each table for checking.")
+                "next to each table for checking.",
+                disclaimer="\u26a0  Note: Tried our best, but not able to extract correctly "
+                           "\u2014 both axes are logarithmic and the digitised values are approximate. "
+                           "Use the embedded figure as the authoritative source.")
     wb.save(out_path)
     fc=len(set(r["param"] for r in rows if r["found"]))
     tc=len(set(r["param"] for r in rows))
@@ -4858,9 +5221,9 @@ def write_excel(info,rows,out_path,derating=None):
 
 def main():
     ap=argparse.ArgumentParser(
-        description="Universal Power-MOSFET Parameter Extractor v1 [Single File]\n"
+        description="Universal Power-MOSFET Parameter Extractor v19 [Single File]\n"
                     "Mfrs: Infineon|ST|ON Semi|Toshiba|Nexperia|Vishay|ROHM|Wolfspeed|IXYS\n"
-                    "\nUsage: python mosfet_extractor_v1.py [optional: path_to_pdf]",
+                    "\nUsage: python mosfet_extractor_v19.py [optional: path_to_pdf]",
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("pdf", nargs="?", default=None,
                     help="Path to MOSFET datasheet PDF (optional — prompted if not given)")
